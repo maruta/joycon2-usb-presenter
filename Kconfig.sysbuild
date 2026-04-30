@@ -1,0 +1,9 @@
+# nRF52840 dongle does not need the legacy partition manager (single-core
+# SoC, no MCUboot/bootloader image to coordinate). Disabling here silences
+# the PARTITION_MANAGER deprecation warning.
+
+config PARTITION_MANAGER
+	bool
+	default n
+
+source "share/sysbuild/Kconfig"

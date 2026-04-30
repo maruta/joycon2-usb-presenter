@@ -1,0 +1,9 @@
+/ {
+	hid_dev_0: hid_dev_0 {
+		compatible = "zephyr,hid-device";
+		label = "HID0";
+		protocol-code = "none";
+		in-report-size = <16>;
+		in-polling-period-us = <8000>;
+	};
+};

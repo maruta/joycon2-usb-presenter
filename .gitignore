@@ -1,0 +1,25 @@
+# editors
+*.swp
+*~
+.vscode/
+.idea/
+.DS_Store
+
+# AI / session-local state
+/.claude/
+
+# debug / capture artifacts
+/log/
+
+# build
+/build*/
+
+# stray firmware artifacts that occasionally land outside /build/
+*.elf
+*.hex
+*.bin
+*.map
+
+# Zephyr / west local overrides
+prj_*.conf.local
+*.overlay.local
