@@ -4,6 +4,7 @@
 .vscode/
 .idea/
 .DS_Store
+.references/
 
 # AI / session-local state
 /.claude/

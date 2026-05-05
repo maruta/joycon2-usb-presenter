@@ -99,15 +99,20 @@ static void joycon_set_leds(uint8_t mask)
 					     cmd, sizeof(cmd), false);
 }
 
-/* Bit 3 = LED4, used as a "connected" indicator. */
-#define LED_CONNECTED 0x08
-#define LED_CTRL      0x01
+/* Player-LED mask bits sent via joycon_set_leds(). LED1 indicates
+ * laser-pointer mode; LED2-4 form a 3-segment battery gauge (>=70%,
+ * >=40%, >=20%) with LED4 blinking at ~1 Hz when battery is <20%. */
+#define LED_CTRL  0x01    /* LED1 */
+#define LED_BAT2  0x02    /* LED2 */
+#define LED_BAT3  0x04    /* LED3 */
+#define LED_BAT4  0x08    /* LED4 */
 
 static uint32_t prev_buttons;
 
-/* ---- USB HID: composite Keyboard + Mouse, two report IDs ---------------- */
+/* ---- USB HID: composite Keyboard + Mouse + Battery, three report IDs ---- */
 #define HID_RID_KBD   1
 #define HID_RID_MOUSE 2
+#define HID_RID_BAT   3
 
 static const uint8_t hid_report_desc[] = {
 	/* Keyboard collection */
@@ -159,6 +164,19 @@ static const uint8_t hid_report_desc[] = {
 	0x81, 0x06,
 	0xC0,
 	0xC0,
+	/* Battery Strength collection (HID Usage Tables 1.5, page 0x06
+	 * Generic Device Controls / usage 0x20 Battery Strength). Windows,
+	 * macOS, and Linux UPower all surface a battery indicator from this. */
+	0x05, 0x06,       /* Usage Page: Generic Device Controls */
+	0x09, 0x01,       /* Usage: Background Controls (top-level placeholder) */
+	0xA1, 0x01,       /* Collection: Application */
+	0x85, HID_RID_BAT,
+	0x09, 0x20,       /*   Usage: Battery Strength */
+	0x15, 0x00,
+	0x26, 0x64, 0x00, /*   Logical Min 0, Max 100 */
+	0x75, 0x08, 0x95, 0x01,
+	0x81, 0x02,       /*   Input (Data,Var,Abs) — 1-byte percentage */
+	0xC0,
 };
 
 struct __packed kbd_report {
@@ -176,6 +194,23 @@ struct __packed mouse_report {
 	int8_t  wheel_v;
 	int8_t  wheel_h;
 };
+
+struct __packed bat_report {
+	uint8_t report_id;
+	uint8_t pct;
+};
+
+/* Cached most-recent battery voltage (mV) from BLE notifications. 0 means
+ * "not yet observed" or "unavailable" — Joy-Con 2 sends 0x0000 when the
+ * reading isn't ready. Updated from the BT RX path, read from the system
+ * workqueue. uint16 store/load is atomic on Cortex-M, so no lock needed. */
+static volatile uint16_t latest_vbat_mv;
+static uint8_t last_sent_bat_pct = 0xff;  /* sentinel: nothing sent yet */
+
+/* Laser-pointer flag, toggled from the BT RX path (input_notify_cb) and
+ * read by both the input mapping (gates Ctrl) and led_work_handler (sets
+ * LED1). volatile because it crosses thread boundaries. */
+static volatile bool laser_mode;
 
 static const struct device *hid_dev;
 static atomic_t hid_iface_ready_flag;
@@ -212,6 +247,115 @@ static int hid_send(const void *report, size_t len)
 		return -ENODEV;
 	}
 	return hid_device_submit_report(hid_dev, len, report);
+}
+
+/* Li-ion 1-cell piecewise-linear voltage→percentage curve. The discharge
+ * curve is highly non-linear: a long flat plateau around 3.7-3.9 V holds
+ * most of the usable charge, with steep drops at both ends. A small
+ * lookup table interpolated linearly tracks that shape well enough for a
+ * battery-icon UI without needing a coulomb counter. */
+static uint8_t vbat_mv_to_pct(uint16_t mv)
+{
+	static const struct { uint16_t mv; uint8_t pct; } curve[] = {
+		{ 3300,   0 },
+		{ 3500,   5 },
+		{ 3600,  15 },
+		{ 3700,  30 },
+		{ 3750,  45 },
+		{ 3800,  55 },
+		{ 3850,  65 },
+		{ 3900,  75 },
+		{ 3950,  82 },
+		{ 4000,  88 },
+		{ 4100,  95 },
+		{ 4200, 100 },
+	};
+	if (mv <= curve[0].mv) {
+		return 0;
+	}
+	if (mv >= curve[ARRAY_SIZE(curve) - 1].mv) {
+		return 100;
+	}
+	for (size_t i = 1; i < ARRAY_SIZE(curve); i++) {
+		if (mv < curve[i].mv) {
+			uint16_t span = curve[i].mv - curve[i - 1].mv;
+			uint16_t off  = mv - curve[i - 1].mv;
+			uint8_t  dpct = curve[i].pct - curve[i - 1].pct;
+			return curve[i - 1].pct +
+			       (uint8_t)((uint32_t)off * dpct / span);
+		}
+	}
+	return 100;
+}
+
+static void bat_send_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(bat_work, bat_send_handler);
+
+#define BAT_SEND_PERIOD K_SECONDS(30)
+
+/* led_work owns the player-LED mask. Battery-bar (LED2-4) and laser-mode
+ * indicator (LED1) are composed every LED_PERIOD; BLE writes only happen
+ * when the resulting mask differs from the last one sent, so steady
+ * states cost nothing on the air. The 500 ms period also drives the
+ * <20% blink. */
+#define LED_PERIOD K_MSEC(500)
+
+static void led_work_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(led_work, led_work_handler);
+
+static uint8_t last_led_mask = 0xff;  /* sentinel: nothing sent yet */
+static bool led_blink_phase;
+
+static void led_work_handler(struct k_work *work)
+{
+	uint16_t mv = latest_vbat_mv;
+	uint8_t  bat_mask = 0;
+
+	led_blink_phase = !led_blink_phase;
+
+	if (mv != 0) {
+		uint8_t pct = vbat_mv_to_pct(mv);
+
+		if (pct >= 70) {
+			bat_mask = LED_BAT2 | LED_BAT3 | LED_BAT4;
+		} else if (pct >= 40) {
+			bat_mask = LED_BAT3 | LED_BAT4;
+		} else if (pct >= 20) {
+			bat_mask = LED_BAT4;
+		} else {
+			bat_mask = led_blink_phase ? LED_BAT4 : 0;
+		}
+	}
+
+	uint8_t mask = bat_mask | (laser_mode ? LED_CTRL : 0);
+
+	if (mask != last_led_mask) {
+		joycon_set_leds(mask);
+		last_led_mask = mask;
+	}
+	k_work_schedule(&led_work, LED_PERIOD);
+}
+
+static void bat_send_handler(struct k_work *work)
+{
+	uint16_t mv = latest_vbat_mv;
+
+	if (mv != 0) {
+		uint8_t pct = vbat_mv_to_pct(mv);
+
+		if (pct != last_sent_bat_pct) {
+			struct bat_report br = {
+				.report_id = HID_RID_BAT,
+				.pct       = pct,
+			};
+
+			if (hid_send(&br, sizeof(br)) == 0) {
+				last_sent_bat_pct = pct;
+				printk("battery: %u mV -> %u%%\n", mv, pct);
+			}
+		}
+	}
+	k_work_schedule(&bat_work, BAT_SEND_PERIOD);
 }
 
 /* HID Usage IDs (Keyboard/Keypad page 0x07) */
@@ -478,10 +622,28 @@ static uint8_t input_notify_cb(struct bt_conn *conn,
 	int16_t gx = (int16_t)sys_get_le16(&p[54]);
 	int16_t gz = (int16_t)sys_get_le16(&p[58]);
 
+	/* Battery voltage (mV LE u16) at offset 0x1F. Field location sourced
+	 * from yujimny/Joycon2test (parse_joycon2_data); the Misaka10571
+	 * README's "0x1C" is off by 3 bytes for this Joy-Con 2 build and
+	 * actually lands in the magnetometer range. Filter to a plausible
+	 * Li-ion 1S range so the 0x0000 "unavailable" frames Joy-Con 2 emits
+	 * right after subscribe (and any future offset regression) don't
+	 * propagate as a bogus 0%. */
+	uint16_t vbat_mv = sys_get_le16(&p[0x1F]);
+
+	if (vbat_mv >= 2500 && vbat_mv <= 4500) {
+		bool first = (latest_vbat_mv == 0);
+
+		latest_vbat_mv = vbat_mv;
+		if (first) {
+			k_work_schedule(&bat_work, K_SECONDS(2));
+		}
+	}
+
 	/* Laser-pointer toggle: L_SL / R_SR edge-press. While ON, Ctrl is
 	 * implicitly held during left-click or scroll. */
 	static uint32_t edge_prev_btn;
-	static bool laser_mode, prev_laser_mode, prev_ctrl_active;
+	static bool prev_laser_mode, prev_ctrl_active;
 	uint32_t pressed_now = btn & ~edge_prev_btn;
 
 	edge_prev_btn = btn;
@@ -501,7 +663,9 @@ static uint8_t input_notify_cb(struct bt_conn *conn,
 	prev_ctrl_active = ctrl_active;
 	if (laser_mode != prev_laser_mode) {
 		prev_laser_mode = laser_mode;
-		joycon_set_leds(LED_CONNECTED | (laser_mode ? LED_CTRL : 0));
+		/* Hand the LED change to led_work; it composes laser + battery
+		 * into one mask. K_NO_WAIT makes the response feel immediate. */
+		(void)k_work_reschedule(&led_work, K_NO_WAIT);
 	}
 
 	if ((btn != prev_buttons) || ctrl_changed) {
@@ -530,16 +694,22 @@ static uint8_t input_notify_cb(struct bt_conn *conn,
 
 /* Send std/ext enables in alternation, twice each. Joy-Con 2 (R)
  * sometimes ignores the first pair if it arrives too soon after CCC
- * subscription, so we always send four. After that, light LED4 to
- * indicate the controller is fully online. */
+ * subscription, so we always send four. After that, hand player-LED
+ * control over to led_work so the battery-bar / laser indicators take
+ * effect. */
 static void enable_send_handler(struct k_work *work)
 {
 	if (!default_conn || !write_handle) {
 		return;
 	}
 	if (enable_step >= 4) {
-		joycon_set_leds(LED_CONNECTED);
-		printk("Initial LED set\n");
+		/* Hand LED control to led_work; it now owns LED2-4 (battery
+		 * bar) and LED1 (laser indicator). Invalidate the cache so
+		 * the very next tick re-sends the mask freshly. */
+		last_led_mask = 0xff;
+		led_blink_phase = false;
+		(void)k_work_reschedule(&led_work, K_NO_WAIT);
+		printk("BLE enables done; LED control armed\n");
 		return;
 	}
 
@@ -813,6 +983,8 @@ static void on_disconnected(struct bt_conn *conn, uint8_t hci_reason)
 	printk("disconnected: %s reason=0x%02x (%s)\n",
 	       addr, hci_reason, bt_hci_err_to_str(hci_reason));
 
+	(void)k_work_cancel_delayable(&led_work);
+	last_led_mask = 0xff;
 	write_handle = 0;
 	release_default_conn(conn);
 	resume_scan();

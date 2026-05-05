@@ -182,9 +182,24 @@ again.
 
 ### LED indicators
 
-- **LED4**: connected
 - **LED1**: laser-pointer mode active
-- LED2 and LED3: unused
+- **LED2-4**: 3-segment battery gauge driven by the Joy-Con 2's reported
+  cell voltage (Li-ion 1S, mapped through a piecewise-linear curve)
+  - ≥ 70%: LED2 + LED3 + LED4 lit
+  - ≥ 40%: LED3 + LED4 lit
+  - ≥ 20%: LED4 lit
+  - < 20%: LED4 blinks at ~1 Hz
+
+LED state is also used as a connection indicator: until the first valid
+battery reading arrives over BLE, all four LEDs stay off, so a lit LED
+means "paired and receiving input notifications."
+
+The host also receives a HID **Battery Strength** input report (Generic
+Device Controls usage page, 0–100%). Windows surfaces this through
+`DEVPKEY_Device_BatteryLevel` for HID devices but does **not** show it
+in the Bluetooth & Devices battery panel — that UI is gated to BLE
+peripherals, and this dongle appears as a USB device. Read the level
+programmatically (PowerShell, hidapi, etc.) if you want a tray icon.
 
 ## Tuning
 
@@ -222,6 +237,10 @@ work:
 - [**Misaka10571/joycon2-connector**](https://github.com/Misaka10571/joycon2-connector)
   — dedicated write characteristic UUID, IMU and optical mouse layout,
   player-LED command format
+- [**yujimny/Joycon2test**](https://github.com/yujimny/Joycon2test) —
+  battery-voltage offset (`0x1F`, u16, mV) inside the input
+  notification, used here to drive the LED battery gauge and the HID
+  Battery Strength report
 
 The Bluetooth-host bring-up scaffolding was originally inspired by
 Nordic Semiconductor's NCS sample `samples/bluetooth/central_hids`, but
