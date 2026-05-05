@@ -29,6 +29,7 @@
 #include <zephyr/usb/usbd.h>
 #include <zephyr/usb/class/usbd_hid.h>
 #include <zephyr/drivers/usb/udc.h>
+#include <zephyr/drivers/gpio.h>
 
 /* Nintendo (Joy-Con 2) custom 128-bit BLE service:
  *   service:      ab7de9be-89fe-49ad-828f-118f09df7fd0
@@ -82,6 +83,30 @@ static const uint8_t enable_ext[] = {
 	0x0c, 0x91, 0x01, 0x04, 0x00, 0x04, 0x00, 0x00,
 	0xff, 0x00, 0x00, 0x00,
 };
+
+/* On-board status LED. Driven on/off as a binary connection indicator:
+ * lit while the BLE link to the Joy-Con 2 is up. Both nrf52840dongle
+ * (PCA10059) and raytac_mdbt50q_cx_40_dongle expose `led0` at P0.06
+ * ACTIVE_LOW; GPIO_DT_SPEC_GET_OR + gpio_is_ready_dt() lets the same
+ * code degrade to a no-op on any board lacking the alias. */
+static const struct gpio_dt_spec status_led =
+	GPIO_DT_SPEC_GET_OR(DT_ALIAS(led0), gpios, {0});
+
+static void status_led_init(void)
+{
+	if (!gpio_is_ready_dt(&status_led)) {
+		return;
+	}
+	(void)gpio_pin_configure_dt(&status_led, GPIO_OUTPUT_INACTIVE);
+}
+
+static void status_led_set(bool on)
+{
+	if (!gpio_is_ready_dt(&status_led)) {
+		return;
+	}
+	(void)gpio_pin_set_dt(&status_led, on ? 1 : 0);
+}
 
 /* Player-LED command, format from Misaka10571/joycon2-connector
  * (BLECommands.h SetPlayerLEDs). Same envelope as the input-enable writes
@@ -622,14 +647,19 @@ static uint8_t input_notify_cb(struct bt_conn *conn,
 	int16_t gx = (int16_t)sys_get_le16(&p[54]);
 	int16_t gz = (int16_t)sys_get_le16(&p[58]);
 
-	/* Battery voltage (mV LE u16) at offset 0x1F. Field location sourced
+	/* Battery voltage at offset 0x1F (LE u16). Field location sourced
 	 * from yujimny/Joycon2test (parse_joycon2_data); the Misaka10571
 	 * README's "0x1C" is off by 3 bytes for this Joy-Con 2 build and
-	 * actually lands in the magnetometer range. Filter to a plausible
-	 * Li-ion 1S range so the 0x0000 "unavailable" frames Joy-Con 2 emits
-	 * right after subscribe (and any future offset regression) don't
-	 * propagate as a bogus 0%. */
-	uint16_t vbat_mv = sys_get_le16(&p[0x1F]);
+	 * actually lands in the magnetometer range. The raw value is a
+	 * 16-bit ADC count with 1.125 mV / LSB (empirically identified
+	 * here by logging raw counts vs. an external reference; the
+	 * "u16 mV" wording from upstream notes is off by ~12.5%). Convert
+	 * to true millivolts as count * 9 / 8, then filter to a plausible
+	 * Li-ion 1S range so the 0x0000 "unavailable" frames Joy-Con 2
+	 * emits right after subscribe (and any future offset regression)
+	 * don't propagate as a bogus 0%. */
+	uint16_t vbat_raw = sys_get_le16(&p[0x1F]);
+	uint16_t vbat_mv = (uint16_t)((uint32_t)vbat_raw * 9 / 8);
 
 	if (vbat_mv >= 2500 && vbat_mv <= 4500) {
 		bool first = (latest_vbat_mv == 0);
@@ -963,6 +993,7 @@ static void on_connected(struct bt_conn *conn, uint8_t hci_err)
 
 	if (hci_err == 0U) {
 		printk("connected: %s\n", addr);
+		status_led_set(true);
 		/* Discovery runs on the system workqueue to keep the BT RX
 		 * thread's stack lean. */
 		gatt_discover(conn);
@@ -986,6 +1017,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t hci_reason)
 	(void)k_work_cancel_delayable(&led_work);
 	last_led_mask = 0xff;
 	write_handle = 0;
+	status_led_set(false);
 	release_default_conn(conn);
 	resume_scan();
 }
@@ -1136,6 +1168,7 @@ static int bt_bringup(void)
 
 int main(void)
 {
+	status_led_init();
 	/* USB first: CDC ACM is the console, HID is the presenter output. */
 	usb_setup();
 	k_sleep(K_SECONDS(3));   /* let the host open the virtual COM port */

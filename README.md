@@ -39,7 +39,10 @@ an issue, and include reproduction details if you do file one.
 
 ## Hardware
 
-- **Dongle**: tested on **Raytac MDBT50Q-CX-40** (nRF52840 USB dongle).
+- **Dongle**: tested on:
+  - **Raytac MDBT50Q-CX-40** (nRF52840 USB dongle), and
+  - **Nordic nRF52840 Dongle (PCA10059)**.
+
   Other nRF52840 USB dongles with the same Zephyr board target should
   work; you may need a board-specific overlay if pinout differs.
 - **Controller**: Nintendo Switch 2 **Joy-Con 2** (left or right).
@@ -70,7 +73,15 @@ tested end to end.
    → Open Folder…`).
 4. In the nRF Connect side panel, click **Add build configuration** for
    this application. In the dialog:
-   - **Board target**: `raytac_mdbt50q_cx_40_dongle/nrf52840`
+   - **Board target**: one of
+     - `raytac_mdbt50q_cx_40_dongle/nrf52840` (Raytac MDBT50Q-CX-40), or
+     - `nrf52840dongle/nrf52840` (Nordic PCA10059).
+       **Do NOT pick the `/bare` variant** — that target links the app at
+       flash 0x0 and is intended for SWD/J-Link flashing. Flashing a
+       `/bare` build through the stock Open Bootloader will appear to
+       succeed but the dongle will be silent on replug. (Recovery: hold
+       RESET while plugging in to re-enter DFU mode and reflash with the
+       non-`/bare` target.)
    - Leave the rest at defaults
    - Click **Build Configuration**
 5. Wait for the initial CMake/build to finish. The HEX image lands at
@@ -84,7 +95,11 @@ that affects the build system, click **Pristine Build** instead of
 ## Build & flash — option B: command line (`west`)
 
 ```bash
+# Raytac MDBT50Q-CX-40
 west build -b raytac_mdbt50q_cx_40_dongle/nrf52840 -p
+
+# Nordic nRF52840 Dongle (PCA10059) — DO NOT use the /bare variant
+west build -b nrf52840dongle/nrf52840 -p
 ```
 
 The HEX image lands at
@@ -92,23 +107,42 @@ The HEX image lands at
 
 ### Flash
 
-`west flash` does **not** work with this dongle. Use the **nRF Connect
-for Desktop → Programmer** app instead, going through the on-chip USB
-DFU bootloader.
+`west flash` does **not** work with either dongle. Use the **nRF Connect
+for Desktop → Programmer** app instead, going through each dongle's
+on-chip USB DFU bootloader. Common to both: the running firmware does
+not provide an automatic DFU trigger, so re-entering DFU later requires
+the button-hold-on-plug-in dance again.
+
+#### Raytac MDBT50Q-CX-40
 
 1. Unplug the dongle.
 2. Hold down the on-board user button **while** plugging it in. Keep
    holding until Windows enumerates the dongle as a DFU device (a
    different VID/PID than the running firmware).
-3. Open **nRF Connect for Desktop → Programmer**, select the dongle in
-   the device list, choose **Add file → Browse**, pick
+3. In Programmer, select the dongle, **Add file → Browse**, pick
    `build/joycon2-usb-presenter/zephyr/zephyr.hex`, then click
    **Write**.
 4. After the write completes the dongle re-enumerates with the new
    firmware.
 
-Re-entering DFU later requires the same button-hold-on-plug-in dance —
-the running firmware does not provide an automatic DFU trigger.
+#### Nordic nRF52840 Dongle (PCA10059)
+
+1. Unplug the dongle.
+2. Hold the small **RESET** button on the side **while** plugging it
+   in. The stock Nordic Open USB CDC DFU Bootloader enumerates as a
+   "Bootloader" CDC ACM device.
+3. In Programmer, select the dongle, **Add file → Browse**, pick
+   `build/joycon2-usb-presenter/zephyr/zephyr.hex`. Programmer asks
+   *"Please select the SoftDevice required by the application
+   firmware"*: choose **Custom** and enter `0` (Zephyr's BLE
+   controller is linked into the app — there is no separate
+   SoftDevice). Click **Write**.
+4. After the write completes the dongle re-enumerates with the new
+   firmware.
+
+If you previously built with the `/bare` board target, delete that
+build directory before retrying — the cached `BOARD_QUALIFIERS` can
+linger across `-p` rebuilds in some VS Code workflows.
 
 ## Pairing the Joy-Con 2
 
@@ -182,6 +216,15 @@ again.
 
 ### LED indicators
 
+#### On-board status LED (dongle)
+
+The dongle's on-board `led0` (green: Raytac D1 / PCA10059 LD1, both at
+P0.06) lights up while the BLE link to the Joy-Con 2 is up, and goes
+off on disconnect or pairing failure. Useful as a quick "is it
+connected?" indicator independent of the Joy-Con player LEDs below.
+
+#### Joy-Con player LEDs
+
 - **LED1**: laser-pointer mode active
 - **LED2-4**: 3-segment battery gauge driven by the Joy-Con 2's reported
   cell voltage (Li-ion 1S, mapped through a piecewise-linear curve)
@@ -238,9 +281,12 @@ work:
   — dedicated write characteristic UUID, IMU and optical mouse layout,
   player-LED command format
 - [**yujimny/Joycon2test**](https://github.com/yujimny/Joycon2test) —
-  battery-voltage offset (`0x1F`, u16, mV) inside the input
-  notification, used here to drive the LED battery gauge and the HID
-  Battery Strength report
+  battery-voltage offset (`0x1F`, u16) inside the input notification,
+  used here to drive the LED battery gauge and the HID Battery
+  Strength report. The raw u16 was empirically identified in this
+  project as a **1.125 mV / LSB** ADC count (the upstream "u16 mV"
+  wording is ~12.5% off); conversion is applied at the read site in
+  [src/main.c](src/main.c).
 
 The Bluetooth-host bring-up scaffolding was originally inspired by
 Nordic Semiconductor's NCS sample `samples/bluetooth/central_hids`, but
