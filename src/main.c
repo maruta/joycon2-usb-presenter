@@ -447,7 +447,7 @@ static void build_kbd_report(uint32_t btn, bool ctrl_active,
 #undef ADD_KEY
 }
 
-#define GYRO_DEADZONE 50    /* raw units */
+#define GYRO_DEADZONE 0    /* raw units */
 #define GYRO_DIVISOR  32    /* tune mouse speed */
 /* Joy-Con 2 optical mouse sensor scaling. Raw values are an int16 absolute
  * counter at bytes 16-19; we diff successive samples. Increase to slow the
@@ -460,8 +460,27 @@ static void build_kbd_report(uint32_t btn, bool ctrl_active,
  * gives ≈12 clicks/sec at full deflection, ≈3 clicks/sec at quarter tilt. */
 #define WHEEL_ACCUM_THRESH 2000
 
+/* Drag-start hysteresis (cursor mickeys, Manhattan). The mechanical act of
+ * pressing ZR/ZL imparts a small angular kick that survives GYRO_DEADZONE
+ * for a frame or two; left in, that kick rides the click and registers as
+ * the start of a drag. Hold motion back while the left button is held until
+ * accumulated |dx|+|dy| crosses this threshold, then release the
+ * accumulator in one shot and let the rest of the click flow freely. */
+#define DRAG_HYSTERESIS_THRESH 10
+
+/* Time deadzone after the click rising edge. The first ~50-100 ms of motion
+ * is dominated by the mechanical kick from depressing ZR/ZL; we drop those
+ * samples wholesale (no accumulation) so they can't even contribute to the
+ * hysteresis threshold. After the window elapses, hysteresis takes over. */
+#define DRAG_TIME_DEADZONE_MS 80
+
 static int32_t wheel_h_accum;
 static int32_t wheel_v_accum;
+static int32_t drag_pending_dx;
+static int32_t drag_pending_dy;
+static bool    drag_released;
+static bool    drag_prev_left_btn;
+static int64_t drag_mute_until_ms;
 
 static bool build_mouse_report(uint32_t btn,
 			       int16_t gx, int16_t gz,
@@ -505,6 +524,45 @@ static bool build_mouse_report(uint32_t btn,
 	 * surface it dominates. */
 	dx_total += opt_dx / OPTICAL_DIVISOR;
 	dy_total += opt_dy / OPTICAL_DIVISOR;
+
+	/* Click-induced motion suppression in two layers. While the left
+	 * button is up, reset everything so the next click starts fresh. On
+	 * the rising edge, arm the time deadzone window. While inside that
+	 * window, drop dx/dy outright (no accumulation) — these samples are
+	 * almost entirely the mechanical kick from depressing ZR/ZL. After
+	 * the window, hysteresis takes over: accumulate locally and keep the
+	 * report at zero until |dx|+|dy| crosses the threshold, then dump
+	 * the accumulator in one frame and stay released until the button
+	 * releases. */
+	bool left_btn = (r->buttons & 0x01) != 0;
+	if (left_btn && !drag_prev_left_btn) {
+		drag_mute_until_ms = k_uptime_get() + DRAG_TIME_DEADZONE_MS;
+	}
+	drag_prev_left_btn = left_btn;
+
+	if (!left_btn) {
+		drag_released      = false;
+		drag_pending_dx    = 0;
+		drag_pending_dy    = 0;
+		drag_mute_until_ms = 0;
+	} else if (k_uptime_get() < drag_mute_until_ms) {
+		dx_total = 0;
+		dy_total = 0;
+	} else if (!drag_released) {
+		drag_pending_dx += dx_total;
+		drag_pending_dy += dy_total;
+		if (abs(drag_pending_dx) + abs(drag_pending_dy) >=
+		    DRAG_HYSTERESIS_THRESH) {
+			dx_total        = drag_pending_dx;
+			dy_total        = drag_pending_dy;
+			drag_pending_dx = 0;
+			drag_pending_dy = 0;
+			drag_released   = true;
+		} else {
+			dx_total = 0;
+			dy_total = 0;
+		}
+	}
 
 	r->dx = (int8_t)CLAMP(dx_total, -127, 127);
 	r->dy = (int8_t)CLAMP(dy_total, -127, 127);
